@@ -600,6 +600,11 @@ class Deque(Sequence):
 
         If steps is negative then rotate left.
 
+        Rotation only updates the keys of the rows in the underlying cache.
+        Values are neither deserialized nor rewritten so large values remain
+        in their files on disk. Tags and expire times follow their values.
+        The rotation is applied in a single transaction.
+
         >>> deque = Deque()
         >>> deque += range(5)
         >>> deque.rotate(2)
@@ -612,36 +617,76 @@ class Deque(Sequence):
         :param int steps: number of steps to rotate (default 1)
 
         """
+        # pylint: disable=protected-access,unidiomatic-typecheck
         if not isinstance(steps, int):
             type_name = type(steps).__name__
             raise TypeError('integer argument expected, got %s' % type_name)
 
-        len_self = len(self)
+        cache = self._cache
 
-        if not len_self:
+        if not len(cache):
             return
 
-        if steps >= 0:
-            steps %= len_self
+        with cache.transact(retry=True):
+            sql = cache._sql
 
-            for _ in range(steps):
-                try:
-                    value = self._pop()
-                except IndexError:
-                    return
-                else:
-                    self._appendleft(value)
-        else:
-            steps *= -1
-            steps %= len_self
+            # Iterate keys like Cache.iterkeys. Keys are not assumed to be
+            # contiguous; items may have been deleted from the middle.
 
-            for _ in range(steps):
-                try:
-                    value = self._popleft()
-                except IndexError:
+            rows = sql(
+                'SELECT rowid, key FROM Cache ORDER BY key, raw'
+            ).fetchall()
+            count = len(rows)
+
+            if count == 0:
+                return
+
+            # Python's modulo handles negative steps like collections.deque.
+
+            steps %= count
+
+            if steps == 0:
+                return
+
+            update = 'UPDATE Cache SET key = ?, raw = 1 WHERE rowid = ?'
+
+            if steps <= count - steps:
+                # Rotate right by moving the last `steps` rows to the front.
+                # When the smallest key is an integer with room below, the
+                # moved rows are simply assigned the keys beneath it.
+                first_key = rows[0][1]
+
+                if type(first_key) is int and first_key > steps:
+                    for index, (rowid, _) in enumerate(rows[count - steps :]):
+                        key = first_key - steps + index
+                        sql(update, (key, rowid))
                     return
-                else:
-                    self._append(value)
+            else:
+                # Rotate right by moving the first `count - steps` rows to
+                # the back. When the largest key is an integer with room
+                # above, the moved rows are assigned the keys beyond it.
+                last_key = rows[-1][1]
+                moved = rows[: count - steps]
+
+                if type(last_key) is int and last_key < 999999999999999 - len(
+                    moved
+                ):
+                    for index, (rowid, _) in enumerate(moved):
+                        key = last_key + index + 1
+                        sql(update, (key, rowid))
+                    return
+
+            # Otherwise renumber all rows in rotated order. Keys are first
+            # reset to NULL, which the unique index treats as distinct, so
+            # that reassignment cannot collide with existing keys. Keys are
+            # centered at 500 trillion like Cache.push to leave room for
+            # pushes on either side.
+            sql('UPDATE Cache SET key = NULL')
+            base = 500000000000000 - count // 2
+            rotated = rows[count - steps :] + rows[: count - steps]
+
+            for index, (rowid, _) in enumerate(rotated):
+                sql(update, (base + index, rowid))
 
     __hash__ = None  # type: ignore
 
