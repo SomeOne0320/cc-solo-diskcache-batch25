@@ -102,6 +102,30 @@ def test_custom_disk():
 
         test_memoize_iter(cache)
 
+
+def test_get_many_custom_disk():
+    with dc.Cache(disk=dc.JSONDisk, disk_min_file_size=0) as cache:
+        values = [None, True, 0, 1.23, {}, [None] * 10000]
+        tags = ['tag%d' % index for index in range(len(values))]
+
+        for value, tag in zip(values, tags):
+            cache.set(value, value, tag=tag)
+
+        keys = values + [('missing',)] + values[:2]
+        expected = values + [None] + values[:2]
+
+        # Custom key formats are encoded and decoded the same as Cache.get.
+        assert cache.get_many(keys) == expected
+        assert cache.get_many(keys, 'dne') == values + ['dne'] + values[:2]
+
+        results = cache.get_many(values, tag=True)
+        assert results == [(value, tag) for value, tag in zip(values, tags)]
+
+        missing = cache.get_many(
+            ['missing'], 'dne', expire_time=True, tag=True
+        )
+        assert missing == [('dne', None, None)]
+
     shutil.rmtree(cache.directory, ignore_errors=True)
 
 
@@ -248,6 +272,262 @@ def test_read(cache):
     cache.set(0, b'abcd' * 2**20)
     with cache.read(0) as reader:
         assert reader is not None
+
+
+def test_get_many(cache):
+    assert cache.set(0, 0, tag='zero')
+    assert cache.set(1, 1, tag='one')
+    assert cache.set(2, 2, expire=1e-9, tag='expired')
+    assert cache.set(3, 3, tag='three')
+    time.sleep(0.01)
+
+    assert cache.get_many([0, 1, 2, 4]) == [0, 1, None, None]
+    assert cache.get_many([0, 1, 2, 4], 'dne') == [0, 1, 'dne', 'dne']
+    assert cache.get_many([]) == []
+    assert cache.get_many(iter([3, 0, 4])) == [3, 0, None]
+
+    # Duplicate positions keep their place and repeat the result.
+
+    assert cache.get_many([1, 4, 1, 0, 1]) == [1, None, 1, 0, 1]
+    assert cache.get_many([1, 4, 1], 'dne') == [1, 'dne', 1]
+
+    # Order is request order, not cache or hash order.
+
+    assert cache.get_many([3, 0, 4, 1]) == [3, 0, None, 1]
+
+    # Return shapes match Cache.get.
+
+    assert cache.get_many([0, 4], tag=True) == [(0, 'zero'), (None, None)]
+    assert cache.get_many([0, 4], expire_time=True) == [
+        (0, None),
+        (None, None),
+    ]
+    assert cache.get_many([0, 4], expire_time=True, tag=True) == [
+        (0, None, 'zero'),
+        (None, None, None),
+    ]
+    assert cache.get_many([0, 4], 'dne', tag=True) == [
+        (0, 'zero'),
+        ('dne', None),
+    ]
+
+    # The expired key is a miss even though it is present in the table.
+
+    assert cache.get(2, 'dne') == 'dne'
+
+
+def test_get_many_iterable_order(cache):
+    # Keys are consumed eagerly so a one-shot iterator works.
+    keys = (key for key in [3, 1, 2])
+    assert cache.get_many(keys, 'dne') == ['dne', 'dne', 'dne']
+
+    cache[1] = 1
+    cache[2] = 2
+    cache[3] = 3
+
+    keys = (key for key in [3, 1, 2, 3])
+    assert cache.get_many(keys) == [3, 1, 2, 3]
+
+
+def test_get_many_snapshot(cache):
+    # Values and expiration are read from one snapshot and one point in time.
+
+    count = 1000
+
+    for value in range(count):
+        cache[value] = value
+
+    assert cache.get_many(range(count)) == list(range(count))
+    assert cache.get_many(reversed(range(count))) == list(
+        reversed(range(count))
+    )
+
+    # Keys missing, expired, and present are all resolved together.
+
+    cache.set('expired', 'x', expire=1e-9)
+    cache.set('kept', 'y', expire=3600)
+    time.sleep(0.01)
+
+    keys = list(range(count)) + ['expired', 'kept', 'missing']
+    expected = list(range(count)) + [None, 'y', None]
+    assert cache.get_many(keys) == expected
+
+
+def test_get_many_snapshot_concurrent(cache):
+    # A concurrent writer updates a pair of related keys inside one
+    # transaction. Batched reads must never observe one without the other's
+    # matching update.
+
+    cache.set('value', 0)
+    cache.set('related', ('related', 0))
+
+    counter = [0]
+    stop = threading.Event()
+
+    def writer():
+        while not stop.is_set():
+            counter[0] += 1
+            with cache.transact():
+                cache.set('value', counter[0], retry=True)
+                cache.set('related', ('related', counter[0]), retry=True)
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+
+    try:
+        for _ in range(1000):
+            value, related = cache.get_many(['value', 'related'])
+            if value is not None and related is not None:
+                assert related[1] == value
+    finally:
+        stop.set()
+        thread.join()
+
+
+def test_get_many_file_values(cache):
+    cache.set(0, 0)
+    cache.set(1, b'x' * 2**20)
+    cache.set(2, 'y' * 2**20)
+    cache.set(3, (None,) * 2**20)
+
+    assert cache.get_many([0, 1, 2, 3]) == [
+        0,
+        b'x' * 2**20,
+        'y' * 2**20,
+        (None,) * 2**20,
+    ]
+
+    # Each duplicate position gets its own file handle because a handle is
+    # consumed by reading.
+
+    readers = cache.get_many([1, 1, 1], read=True)
+    assert all(reader.read(1) == b'x' for reader in readers)
+    for reader in readers:
+        reader.close()
+
+    # Small values are returned directly even with read=True.
+
+    assert cache.get_many([0], read=True) == [0]
+
+
+def test_get_many_ioerror(cache):
+    assert cache.set(0, 0)
+    assert cache.set(1, 1)
+
+    disk = mock.Mock()
+    fetch = mock.Mock()
+
+    disk.put = cache.disk.put
+    disk.fetch = fetch
+    io_error = IOError()
+    io_error.errno = errno.ENOENT
+    fetch.side_effect = io_error
+
+    with mock.patch.object(cache, '_disk', disk):
+        # Fast path: unreadable values become defaults at their positions.
+        assert cache.get_many([0, 1, 0]) == [None, None, None]
+
+    cache.reset('statistics', True)
+
+    with mock.patch.object(cache, '_disk', disk):
+        # Slow path: unreadable values count as misses.
+        assert cache.get_many([0, 1, 0], 'dne', tag=True) == [
+            ('dne', None),
+            ('dne', None),
+            ('dne', None),
+        ]
+
+    assert cache.stats(reset=True) == (0, 3)
+
+
+def test_get_many_chunk_retry(cache):
+    count = 1000
+
+    for value in range(count):
+        cache[value] = value
+
+    # More unique keys than fit in one chunk, exercising the snapshot
+    # transaction used for chunked reads.
+    assert cache.get_many(range(count), retry=True) == list(range(count))
+
+
+def test_get_many_stats(cache):
+    cache.stats(enable=True, reset=True)
+    cache.set(0, 0)
+    cache.set(1, 1)
+    cache.set(2, 2, expire=1e-9)
+    time.sleep(0.01)
+
+    # Hits and misses count per requested position, including duplicates.
+
+    assert cache.get_many([0, 0, 1, 2, 3, 3]) == [0, 0, 1, None, None, None]
+    hits, misses = cache.stats()
+    assert hits == 3
+    assert misses == 3
+
+    assert cache.get_many([0], 'dne', tag=True) == [(0, None)]
+    hits, misses = cache.stats()
+    assert hits == 4
+    assert misses == 3
+
+
+def test_get_many_eviction(cache):
+    cache.reset('statistics', True)
+    cache[0] = 0
+    cache[1] = 1
+
+    cache.get_many([0, 0, 1, 1, 2])
+
+    # Access stats updated without error.
+    assert len(cache.check()) == 0
+
+    cache.reset('eviction_policy', 'least-frequently-used')
+    cache[0] = 0
+
+    cache.get_many([0, 0, 0])
+
+    ((access_count,),) = cache._sql(
+        'SELECT access_count FROM Cache WHERE key = ?', (0,)
+    ).fetchall()
+
+    # Access is updated once for the key, not once per duplicate position.
+    assert access_count == 1
+
+
+def test_get_many_timeout(cache):
+    transact = mock.Mock()
+    transact.side_effect = dc.Timeout
+    cache.reset('statistics', True)
+
+    with mock.patch.object(cache, '_transact', transact):
+        with pytest.raises(dc.Timeout):
+            cache.get_many([0, 1])
+
+
+def test_get_many_bulk(cache):
+    # More keys than fit in a single query chunk. Results must still be
+    # consistent and in request order.
+
+    count = 3000
+
+    for value in range(count):
+        cache[value] = value
+
+    keys = list(range(count))
+    assert cache.get_many(keys) == keys
+
+    keys = [count - 1, 0] + list(range(count))
+    expected = [count - 1, 0] + list(range(count))
+    assert cache.get_many(keys) == expected
+
+    # Expiration is still resolved per position across chunks.
+
+    cache.set('expired', 'x', expire=1e-9)
+    time.sleep(0.01)
+    keys = list(range(count)) + ['expired', 'missing']
+    expected = list(range(count)) + [None, None]
+    assert cache.get_many(keys) == expected
 
 
 def test_read_keyerror(cache):

@@ -295,6 +295,130 @@ def test_get_timeout(cache):
         assert cache.get(0) is None
 
 
+def test_get_many(cache):
+    for num in range(100):
+        cache.set(num, num, tag='tag%d' % num)
+
+    cache.set('expired', 'x', expire=1e-9, tag='expired')
+    time.sleep(0.01)
+
+    keys = [5, 'missing', 17, 5, 'expired', 0, 99, 42, 42]
+    expected = [5, None, 17, 5, None, 0, 99, 42, 42]
+
+    assert cache.get_many(keys) == expected
+    assert cache.get_many(iter(keys)) == expected
+    assert cache.get_many(keys, 'dne') == [
+        5,
+        'dne',
+        17,
+        5,
+        'dne',
+        0,
+        99,
+        42,
+        42,
+    ]
+    assert cache.get_many([]) == []
+
+    # Return shapes match FanoutCache.get.
+
+    assert cache.get_many([5, 'missing'], 'dne', tag=True) == [
+        (5, 'tag5'),
+        ('dne', None),
+    ]
+    assert cache.get_many([5, 'missing'], 'dne', expire_time=True) == [
+        (5, None),
+        ('dne', None),
+    ]
+    assert cache.get_many(
+        [5, 'missing'], 'dne', expire_time=True, tag=True
+    ) == [(5, None, 'tag5'), ('dne', None, None)]
+
+
+def test_get_many_shards(cache):
+    # Results from all shards are reassembled in request order.
+
+    keys = list(range(200))
+    for num in keys:
+        cache.set(num, num)
+
+    assert cache.get_many(keys) == keys
+    assert cache.get_many(reversed(keys)) == list(reversed(keys))
+
+    # Large file values load correctly regardless of shard.
+
+    for num in range(0, 200, 17):
+        cache.set(num, b'x' * 2**20)
+
+    keys = [0, 1, 17, 34, 51]
+    expected = [
+        b'x' * 2**20,
+        1,
+        b'x' * 2**20,
+        b'x' * 2**20,
+        b'x' * 2**20,
+    ]
+    assert cache.get_many(keys) == expected
+
+    # Duplicate file values get separate handles.
+
+    readers = cache.get_many([0, 0], read=True)
+    assert all(reader.read(1) == b'x' for reader in readers)
+    for reader in readers:
+        reader.close()
+
+
+def test_get_many_stats(cache):
+    cache.stats(enable=True)
+    for num in range(100):
+        cache.set(num, num)
+
+    cache.set('expired', 'x', expire=1e-9)
+    time.sleep(0.01)
+    hits0, misses0 = cache.stats()
+
+    keys = [0, 1, 0, 1, 'missing', 'expired', 'missing']
+    assert cache.get_many(keys) == [0, 1, 0, 1, None, None, None]
+
+    hits1, misses1 = cache.stats()
+
+    # Statistics count per requested position, including duplicates.
+
+    assert hits1 - hits0 == 4
+    assert misses1 - misses0 == 3
+
+
+def test_get_many_bulk(cache):
+    # Each shard receives more keys than fit in a single query chunk.
+
+    count = 2400
+
+    for num in range(count):
+        cache.set(num, num)
+
+    keys = list(range(count))
+    assert cache.get_many(keys) == keys
+
+    keys = [count - 1, 0] + list(range(count))
+    assert cache.get_many(keys) == [count - 1, 0] + list(range(count))
+
+    assert cache.get_many(list(reversed(keys))) == list(reversed(keys))
+
+
+def test_get_many_timeout(cache):
+    shards = mock.Mock()
+    shard = mock.Mock()
+    get_many_func = mock.Mock()
+
+    shards.__getitem__ = mock.Mock(side_effect=lambda key: shard)
+    shard.get_many = get_many_func
+    get_many_func.side_effect = dc.Timeout
+
+    with mock.patch.object(cache, '_shards', shards):
+        assert cache.get_many([0, 1]) == [None, None]
+        assert cache.get_many([0, 1], 'dne') == ['dne', 'dne']
+
+
 def test_pop(cache):
     for num in range(100):
         cache[num] = num

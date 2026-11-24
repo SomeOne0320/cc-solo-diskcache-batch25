@@ -6,6 +6,7 @@ import contextlib as cl
 import errno
 import functools as ft
 import io
+import itertools as it
 import json
 import os
 import os.path as op
@@ -1220,6 +1221,262 @@ class Cache:
             return (value, db_tag)
         else:
             return value
+
+    def get_many(
+        self,
+        keys,
+        default=None,
+        read=False,
+        expire_time=False,
+        tag=False,
+        retry=False,
+    ):
+        """Retrieve values from cache for each key in `keys`.
+
+        Results are returned as a list with one entry per position in `keys`,
+        in the same order. Duplicate keys produce duplicate entries. Keys that
+        are missing or expired use `default` at their position.
+
+        Metadata for all keys is read from a single database snapshot and
+        expiration is evaluated against a single point in time, so results are
+        consistent with one another even while other writes are occurring.
+
+        Raises :exc:`Timeout` error when database timeout occurs and `retry` is
+        `False` (default).
+
+        :param keys: iterable of keys for items
+        :param default: value to return if key is missing (default None)
+        :param bool read: if True, return file handles to values
+            (default False)
+        :param bool expire_time: if True, return expire_time in tuple
+            (default False)
+        :param bool tag: if True, return tag in tuple (default False)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: list of values or defaults, one per key in `keys`
+        :raises Timeout: if database timeout occurs
+
+        """
+        keys = list(keys)
+
+        if expire_time and tag:
+            default = (default, None, None)
+        elif expire_time or tag:
+            default = (default, None)
+
+        results = [default] * len(keys)
+
+        if not keys:
+            return results
+
+        db_pairs = [self._disk.put(key) for key in keys]
+        update_column = EVICTION_POLICY[self.eviction_policy]['get']
+
+        # Group requests by (key, raw) pair so each key is queried once even
+        # when it appears multiple times. Duplicate positions are filled from
+        # the same result.
+
+        pairs = {}
+
+        for index, (db_key, raw) in enumerate(db_pairs):
+            pairs.setdefault((db_key, raw), []).append(index)
+
+        pair_list = list(pairs)
+
+        # Chunk the query to stay below SQLite's variable limit (999 on older
+        # builds). Each query uses three bindings per key.
+
+        chunk_size = 300
+
+        def select_rows(sql, start, chunk):
+            # Each unique (key, raw) pair is queried once. The pair index is
+            # carried through the CTE so returned rows map back to `pairs`
+            # without relying on database value types.
+
+            select = (
+                'WITH p(idx, key, raw) AS (VALUES %s)'
+                ' SELECT p.idx, c.rowid, c.expire_time, c.tag, c.mode,'
+                ' c.filename, c.value FROM p JOIN Cache c'
+                ' ON c.key = p.key AND c.raw = p.raw'
+            ) % ', '.join('(?, ?, ?)' for _ in chunk)
+
+            args = []
+
+            for offset, (db_key, raw) in enumerate(chunk):
+                args.append(start + offset)
+                args.append(db_key)
+                args.append(raw)
+
+            return sql(select, args).fetchall()
+
+        now = time.time()
+
+        def make_result(value, db_expire_time, db_tag):
+            if expire_time and tag:
+                return (value, db_expire_time, db_tag)
+            elif expire_time:
+                return (value, db_expire_time)
+            elif tag:
+                return (value, db_tag)
+            else:
+                return value
+
+        def fetch_result(
+            indices, db_expire_time, db_tag, mode, filename, db_value
+        ):
+            # Return count of positions that received a result. File handles
+            # are not shared between positions because reading one would
+            # consume the others. Values are shared.
+            if read:
+                count = 0
+                for index in indices:
+                    try:
+                        value = self._disk.fetch(
+                            mode, filename, db_value, read
+                        )
+                    except IOError:
+                        continue
+                    results[index] = make_result(value, db_expire_time, db_tag)
+                    count += 1
+                return count
+
+            try:
+                value = self._disk.fetch(mode, filename, db_value, read)
+            except IOError:
+                return 0
+
+            result = make_result(value, db_expire_time, db_tag)
+            for index in indices:
+                results[index] = result
+            return len(indices)
+
+        chunks = [
+            (start, pair_list[start : start + chunk_size])
+            for start in range(0, len(pair_list), chunk_size)
+        ]
+
+        def select_chunks(sql):
+            return list(
+                it.chain.from_iterable(
+                    select_rows(sql, start, chunk) for start, chunk in chunks
+                )
+            )
+
+        if not self.statistics and update_column is None:
+            # Fast path, no transaction necessary. Metadata for all keys is
+            # read without any database writes. Chunked requests read every
+            # chunk inside one deferred transaction so all chunks share a
+            # single snapshot.
+
+            if len(chunks) == 1:
+                start, chunk = chunks[0]
+                rows = select_rows(self._sql, start, chunk)
+            else:
+                sql = self._sql
+
+                if self._con.in_transaction:
+                    # Already inside a transaction, snapshot is shared.
+                    rows = select_chunks(sql)
+                else:
+                    # Begin a deferred read transaction so every chunk reads
+                    # from the same snapshot. Retry when the database is busy
+                    # if requested.
+                    while True:
+                        try:
+                            sql('BEGIN')
+                            break
+                        except sqlite3.OperationalError:
+                            if retry:
+                                continue
+                            raise Timeout from None
+
+                    try:
+                        rows = select_chunks(sql)
+                    except BaseException:
+                        sql('ROLLBACK')
+                        raise
+                    else:
+                        sql('COMMIT')
+
+            for (
+                pair_index,
+                rowid,
+                db_expire_time,
+                db_tag,
+                mode,
+                filename,
+                db_value,
+            ) in rows:  # noqa: E501
+                if db_expire_time is not None and db_expire_time <= now:
+                    continue
+
+                fetch_result(
+                    pairs[pair_list[pair_index]],
+                    db_expire_time,
+                    db_tag,
+                    mode,
+                    filename,
+                    db_value,
+                )
+
+        else:  # Slow path, transaction required.
+            with self._transact(retry) as (sql, _):
+                rows = select_chunks(sql)
+
+                hits = 0
+                rowids = []
+
+                for (
+                    pair_index,
+                    rowid,
+                    db_expire_time,
+                    db_tag,
+                    mode,
+                    filename,
+                    db_value,
+                ) in rows:  # noqa: E501
+                    if db_expire_time is not None and db_expire_time <= now:
+                        continue
+
+                    count = fetch_result(
+                        pairs[pair_list[pair_index]],
+                        db_expire_time,
+                        db_tag,
+                        mode,
+                        filename,
+                        db_value,
+                    )
+
+                    if count:
+                        hits += count
+                        rowids.append(rowid)
+
+                # Every requested position that was not a hit is a miss, this
+                # includes missing keys, expired keys, and values that could
+                # not be read.
+                misses = len(keys) - hits
+
+                if self.statistics:
+                    cache_hit = (
+                        'UPDATE Settings SET value = value + ?'
+                        ' WHERE key = "hits"'
+                    )
+                    cache_miss = (
+                        'UPDATE Settings SET value = value + ?'
+                        ' WHERE key = "misses"'
+                    )
+
+                    if hits:
+                        sql(cache_hit, (hits,))
+                    if misses:
+                        sql(cache_miss, (misses,))
+
+                update = 'UPDATE Cache SET %s WHERE rowid = ?'
+
+                if update_column is not None:
+                    for rowid in rowids:
+                        sql(update % update_column.format(now=now), (rowid,))
+
+        return results
 
     def __getitem__(self, key):
         """Return corresponding value for `key` from cache.

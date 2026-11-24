@@ -286,6 +286,80 @@ class FanoutCache:
         except (Timeout, sqlite3.OperationalError):
             return default
 
+    def get_many(
+        self,
+        keys,
+        default=None,
+        read=False,
+        expire_time=False,
+        tag=False,
+        retry=False,
+    ):
+        """Retrieve values from cache for each key in `keys`.
+
+        Results are returned as a list with one entry per position in `keys`,
+        in the same order. Duplicate keys produce duplicate entries. Keys that
+        are missing or expired use `default` at their position.
+
+        Keys are grouped by shard. All keys for a shard are read from a single
+        database snapshot and expiration is evaluated against a single point
+        in time per shard, then results are reassembled in request order.
+
+        If database timeout occurs then requests for the affected shard use
+        `default` unless `retry` is set to `True` (default `False`).
+
+        :param keys: iterable of keys for items
+        :param default: value to return if key is missing (default None)
+        :param bool read: if True, return file handles to values
+            (default False)
+        :param bool expire_time: if True, return expire_time in tuple
+            (default False)
+        :param bool tag: if True, return tag in tuple (default False)
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: list of values or defaults, one per key in `keys`
+
+        """
+        keys = list(keys)
+
+        if expire_time and tag:
+            fallback = (default, None, None)
+        elif expire_time or tag:
+            fallback = (default, None)
+        else:
+            fallback = default
+
+        results = [fallback] * len(keys)
+
+        if not keys:
+            return results
+
+        indices = {}
+
+        for index, key in enumerate(keys):
+            shard_index = self._hash(key) % self._count
+            indices.setdefault(shard_index, []).append(index)
+
+        for shard_index, shard_indices in indices.items():
+            shard = self._shards[shard_index]
+            shard_keys = [keys[index] for index in shard_indices]
+
+            try:
+                shard_results = shard.get_many(
+                    shard_keys,
+                    default,
+                    read,
+                    expire_time,
+                    tag,
+                    retry,
+                )
+            except (Timeout, sqlite3.OperationalError):
+                continue
+
+            for index, shard_result in zip(shard_indices, shard_results):
+                results[index] = shard_result
+
+        return results
+
     def __getitem__(self, key):
         """Return corresponding value for `key` from cache.
 
