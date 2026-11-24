@@ -1405,3 +1405,262 @@ def test_memoize_iter(cache):
     assert len(cache) == 3
     for key in cache:
         assert cache[key] == 6
+
+
+def _val_files(directory):
+    filenames = set()
+    for dirpath, _, files in os.walk(directory):
+        for name in files:
+            if name.endswith('.val'):
+                full_path = op.join(dirpath, name)
+                filenames.add(op.relpath(full_path, directory))
+    return filenames
+
+
+def _reopen(directory):
+    return dc.Cache(directory)
+
+
+def test_transact_rollback_restores_file_value(tmp_path):
+    """Rolled-back overwrite must leave the old value file readable."""
+    directory = str(tmp_path)
+    cache = dc.Cache(directory, disk_min_file_size=1024)
+    big = b'x' * 4096
+
+    cache.set('key', big + b'0')
+    assert cache.check() == []
+
+    with pytest.raises(RuntimeError):
+        with cache.transact():
+            cache.set('key', big + b'1')
+            raise RuntimeError('rollback')
+
+    # Readable through the same connection before closing.
+    assert cache['key'] == big + b'0'
+
+    # Reopen the database: the key's file must still be on disk.
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache['key'] == big + b'0'
+        assert cache.check() == []
+        assert len(_val_files(directory)) == 1
+
+
+def test_transact_rollback_removes_new_file(tmp_path):
+    """Files written by a failed transaction must not be orphaned."""
+    directory = str(tmp_path)
+    cache = dc.Cache(directory, disk_min_file_size=1024)
+    big = b'y' * 4096
+
+    with pytest.raises(RuntimeError):
+        with cache.transact():
+            cache.set('new-key', big)
+            raise RuntimeError('rollback')
+
+    assert 'new-key' not in cache
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache.get('new-key') is None
+        assert cache.check() == []
+        assert _val_files(directory) == set()
+
+
+def test_transact_commit_removes_replaced_file(tmp_path):
+    """A committed overwrite removes the previous value's file."""
+    directory = str(tmp_path)
+    cache = dc.Cache(directory, disk_min_file_size=1024)
+    big = b'z' * 4096
+
+    cache.set('key', big + b'0')
+
+    with cache.transact():
+        cache.set('key', big + b'1')
+
+    assert cache['key'] == big + b'1'
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache['key'] == big + b'1'
+        assert cache.check() == []
+        assert len(_val_files(directory)) == 1
+
+
+def test_transact_rollback_delete_and_pop(tmp_path):
+    """Delete and pop inside a rolled-back transaction keep the value."""
+    directory = str(tmp_path)
+    cache = dc.Cache(directory, disk_min_file_size=1024)
+    big = b'a' * 4096
+
+    cache.set('delete-key', big)
+    cache.set('pop-key', big)
+
+    with pytest.raises(RuntimeError):
+        with cache.transact():
+            cache.delete('delete-key')
+            cache.pop('pop-key')
+            raise RuntimeError('rollback')
+
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache['delete-key'] == big
+        assert cache['pop-key'] == big
+        assert cache.check() == []
+        assert len(_val_files(directory)) == 2
+
+    # Committing the same operations removes the files.
+    with cache.transact():
+        assert cache.delete('delete-key')
+        assert cache.pop('pop-key') == big
+
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache.get('delete-key') is None
+        assert cache.get('pop-key') is None
+        assert cache.check() == []
+        assert _val_files(directory) == set()
+
+
+def test_transact_rollback_multiple_writes_same_key(tmp_path):
+    """Repeated writes to one key in one batch follow the rollback outcome."""
+    directory = str(tmp_path)
+    cache = dc.Cache(directory, disk_min_file_size=1024)
+    big = b'b' * 4096
+
+    cache.set('key', big + b'0')
+
+    with pytest.raises(RuntimeError):
+        with cache.transact():
+            cache.set('key', big + b'1')
+            cache.set('key', big + b'2')
+            cache.set('key', big + b'3')
+            raise RuntimeError('rollback')
+
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache['key'] == big + b'0'
+        assert cache.check() == []
+        assert len(_val_files(directory)) == 1
+
+    # A committed batch keeps only the final value file.
+    with cache.transact():
+        cache.set('key', big + b'4')
+        cache.set('key', big + b'5')
+
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache['key'] == big + b'5'
+        assert cache.check() == []
+        assert len(_val_files(directory)) == 1
+
+
+def test_transact_nested_rollback_and_commit(tmp_path):
+    """Nested cache operations follow the outer transaction's outcome."""
+    directory = str(tmp_path)
+    cache = dc.Cache(directory, disk_min_file_size=1024)
+    big = b'c' * 4096
+
+    cache.set('key', big + b'0')
+
+    # Inner transaction commits, but outer rollback must restore old value.
+    with pytest.raises(RuntimeError):
+        with cache.transact():
+            cache.set('key', big + b'1')
+            with cache.transact():
+                cache.set('key', big + b'2')
+            raise RuntimeError('rollback')
+
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache['key'] == big + b'0'
+        assert cache.check() == []
+        assert len(_val_files(directory)) == 1
+
+    # Outer commit after nested operations keeps only current files.
+    with cache.transact():
+        with cache.transact():
+            cache.set('key', big + b'3')
+        cache.set('other', big + b'4')
+
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache['key'] == big + b'3'
+        assert cache['other'] == big + b'4'
+        assert cache.check() == []
+        assert len(_val_files(directory)) == 2
+
+
+def test_transact_rollback_pull_and_incr(tmp_path):
+    """Pull and incr file handoff also honors the outer transaction."""
+    directory = str(tmp_path)
+    cache = dc.Cache(directory, disk_min_file_size=1024)
+    big = b'd' * 4096
+
+    cache.push(big)
+    # Expired file-backed key: incr replaces it with a new file-backed value.
+    cache.set('counter', big, expire=0.001)
+    time.sleep(0.01)
+
+    with pytest.raises(RuntimeError):
+        with cache.transact():
+            key, value = cache.pull()
+            assert value == big
+            cache.incr('counter', default=1)
+            raise RuntimeError('rollback')
+
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache.pull()[1] == big
+        assert cache.get('counter') is None
+        assert cache.check() == []
+        assert len(_val_files(directory)) == 1
+
+
+def test_transact_add_existing_key_cleans_its_file(tmp_path):
+    """A failed add already wrote a file; commit and rollback both clean it."""
+    directory = str(tmp_path)
+    cache = dc.Cache(directory, disk_min_file_size=1024)
+    big = b'e' * 4096
+
+    cache.set('key', big + b'0')
+
+    # Key present: add returns False and its freshly written file is dropped.
+    assert cache.add('key', big + b'1') is False
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache['key'] == big + b'0'
+        assert cache.check() == []
+        assert len(_val_files(directory)) == 1
+
+    # Same path, but the surrounding outer transaction rolls back.
+    with pytest.raises(RuntimeError):
+        with cache.transact():
+            assert cache.add('key', big + b'2') is False
+            raise RuntimeError('rollback')
+
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache['key'] == big + b'0'
+        assert cache.check() == []
+        assert len(_val_files(directory)) == 1
+
+
+def test_transact_timeout_removes_prepared_file(tmp_path):
+    """A lock Timeout before BEGIN must remove the already-stored file."""
+    directory = str(tmp_path)
+    cache = dc.Cache(directory, disk_min_file_size=1024, timeout=0.01)
+    big = b'f' * 4096
+
+    holder = dc.Cache(directory, disk_min_file_size=1024)
+    holder._sql('BEGIN IMMEDIATE')
+    try:
+        with pytest.raises(dc.Timeout):
+            cache.set('key', big, retry=False)
+    finally:
+        holder._sql('ROLLBACK')
+        holder.close()
+
+    cache.close()
+    with _reopen(directory) as cache:
+        assert cache.get('key') is None
+        assert cache.check() == []
+        assert _val_files(directory) == set()
+

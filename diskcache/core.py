@@ -440,6 +440,7 @@ class Cache:
         self._directory = directory
         self._timeout = 0  # Manually handle retries during initialization.
         self._local = threading.local()
+        self._local.txns = []
         self._txn_id = None
 
         if not op.isdir(directory):
@@ -705,10 +706,17 @@ class Cache:
         with self._transact(retry=retry):
             yield
 
+    @property
+    def _txns(self):
+        """Per-thread stack of open transaction file-handoff records."""
+        txns = getattr(self._local, 'txns', None)
+        if txns is None:
+            txns = self._local.txns = []
+        return txns
+
     @cl.contextmanager
     def _transact(self, retry=False, filename=None):
         sql = self._sql
-        filenames = []
         _disk_remove = self._disk.remove
         tid = threading.get_ident()
         txn_id = self._txn_id
@@ -729,22 +737,67 @@ class Cache:
                         _disk_remove(filename)
                     raise Timeout from None
 
+        txns = self._txns
+
+        if begin:
+            # Outer transaction owns the file handoff. Files created during
+            # the transaction ("added") must be removed when the transaction
+            # rolls back; files superseded or deleted ("removed") must be
+            # removed only after the transaction commits. Nested transactions
+            # share these sets so their files follow the outer outcome.
+            record = (set(), set())
+            txns.append(record)
+            added, removed = record
+            if filename is not None:
+                added.add(filename)
+        else:
+            added, removed = txns[-1]
+            if filename is not None:
+                added.add(filename)
+
+        def cleanup(name):
+            if name is not None:
+                removed.add(name)
+
         try:
-            yield sql, filenames.append
+            yield sql, cleanup
         except BaseException:
             if begin:
                 assert self._txn_id == tid
                 self._txn_id = None
                 sql('ROLLBACK')
+                txns.pop()
+                for name in added:
+                    _disk_remove(name)
             raise
         else:
             if begin:
                 assert self._txn_id == tid
                 self._txn_id = None
                 sql('COMMIT')
-            for name in filenames:
-                if name is not None:
+                txns.pop()
+                for name in removed:
                     _disk_remove(name)
+
+    def _remove(self, filename):
+        """Remove file-backed value `filename`, honoring open transactions.
+
+        Outside a transaction the file is removed immediately. Inside a
+        transaction the removal is deferred until the outer transaction
+        commits so that a rollback restores the item and its file.
+
+        :param str filename: relative path to the value file
+
+        """
+        if filename is None:
+            return
+
+        txns = self._txns
+
+        if txns:
+            txns[-1][1].add(filename)
+        else:
+            self._disk.remove(filename)
 
     def set(self, key, value, expire=None, read=False, tag=None, retry=False):
         """Set `key` and `value` item in cache.
@@ -1049,15 +1102,19 @@ class Cache:
 
         with self._transact(retry) as (sql, cleanup):
             rows = sql(select, (db_key, raw)).fetchall()
+            added = self._txns[-1][0].add
 
             if not rows:
                 if default is None:
                     raise KeyError(key)
 
                 value = default + delta
-                columns = (None, None) + self._disk.store(
+                size, mode, new_filename, db_value = self._disk.store(
                     value, False, key=key
                 )
+                columns = (None, None, size, mode, new_filename, db_value)
+                if new_filename is not None:
+                    added(new_filename)
                 self._row_insert(db_key, raw, now, columns)
                 self._cull(now, sql, cleanup)
                 return value
@@ -1069,9 +1126,12 @@ class Cache:
                     raise KeyError(key)
 
                 value = default + delta
-                columns = (None, None) + self._disk.store(
+                size, mode, new_filename, db_value = self._disk.store(
                     value, False, key=key
                 )
+                columns = (None, None, size, mode, new_filename, db_value)
+                if new_filename is not None:
+                    added(new_filename)
                 self._row_update(rowid, now, columns)
                 self._cull(now, sql, cleanup)
                 cleanup(filename)
@@ -1321,8 +1381,7 @@ class Cache:
             # Key was deleted before we could retrieve result.
             return default
         finally:
-            if filename is not None:
-                self._disk.remove(filename)
+            self._remove(filename)
 
         if expire_time and tag:
             return value, db_expire_time, db_tag
@@ -1590,8 +1649,7 @@ class Cache:
                 # Key was deleted before we could retrieve result.
                 continue
             finally:
-                if name is not None:
-                    self._disk.remove(name)
+                self._remove(name)
             break
 
         if expire_time and tag:
