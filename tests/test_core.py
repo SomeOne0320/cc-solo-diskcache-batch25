@@ -1405,3 +1405,178 @@ def test_memoize_iter(cache):
     assert len(cache) == 3
     for key in cache:
         assert cache[key] == 6
+
+
+def test_memoize_argument_styles_share_key(cache):
+    calls = []
+
+    @cache.memoize()
+    def func(a, b=2, *, c=3):
+        calls.append((a, b, c))
+        return a, b, c
+
+    keys = [
+        func.__cache_key__(1, 2, c=3),
+        func.__cache_key__(a=1, b=2, c=3),
+        func.__cache_key__(1),
+        func.__cache_key__(1, c=3),
+        func.__cache_key__(1, b=2),
+    ]
+    assert len(set(keys)) == 1
+
+    for args, kwargs in [
+        ((1, 2), {'c': 3}),
+        ((), {'a': 1, 'b': 2, 'c': 3}),
+        ((1,), {}),
+        ((1,), {'c': 3}),
+    ]:
+        assert func(*args, **kwargs) == (1, 2, 3)
+
+    assert len(calls) == 1
+    assert len(cache) == 1
+
+
+def test_memoize_typed(cache):
+    @cache.memoize(name='typed', typed=True)
+    def typed(a):
+        return a
+
+    @cache.memoize(name='untyped', typed=False)
+    def untyped(a):
+        return a
+
+    # With typing, int and float arguments yield distinct keys.
+    assert typed.__cache_key__(3) != typed.__cache_key__(3.0)
+
+    # Without typing, the bound values compare equal so keys match.
+    assert untyped.__cache_key__(3) == untyped.__cache_key__(3.0)
+
+    typed(3)
+    typed(3.0)
+    typed_keys = [key for key in cache if key[0] == 'typed']
+    assert len(typed_keys) == 2
+
+    # Equal normalized keys hit the same memoized result.
+    assert untyped(3) == 3
+    assert untyped(3.0) == 3
+    assert untyped.__cache_key__(3) == untyped.__cache_key__(3.0)
+
+
+def test_memoize_ignore_index_and_name(cache):
+    calls = []
+
+    @cache.memoize(ignore={1, 'c'})
+    def func(a, b, c=3):
+        calls.append((a, b, c))
+        return a, b, c
+
+    assert (
+        func.__cache_key__(1, 2, 3)
+        == func.__cache_key__(1, b=99, c=100)
+    )
+
+    func(1, 2, 3)
+    func(1, b=99, c=100)
+    assert len(calls) == 1
+
+
+def test_memoize_varargs_order_and_kwargs_names(cache):
+    @cache.memoize()
+    def func(*args, **kwargs):
+        return args, kwargs
+
+    # Excess positional arguments keep their order.
+    assert func.__cache_key__(1, 2) != func.__cache_key__(2, 1)
+
+    # Excess keyword arguments are handled by name so order is irrelevant.
+    assert (
+        func.__cache_key__(x=1, y=2)
+        == func.__cache_key__(y=2, x=1)
+    )
+
+    func(1, 2, x=3)
+    func(1, 2, x=3)
+    assert len(cache) == 1
+
+
+def test_memoize_legacy_key_still_readable(cache):
+    calls = []
+
+    @cache.memoize()
+    def func(a, b=2):
+        calls.append((a, b))
+        return a + b
+
+    from diskcache.core import args_to_key, full_name
+
+    legacy_key = args_to_key(
+        (full_name(func.__wrapped__),), (10, 20), {}, False, ()
+    )
+    cache.set(legacy_key, 'legacy-value')
+
+    # Original positional calling style reads the legacy entry.
+    assert func(10, 20) == 'legacy-value'
+    assert calls == []
+
+    # The legacy entry is neither migrated nor renewed.
+    assert legacy_key in cache
+    assert func.__cache_key__(10, 20) not in cache
+
+    # A new calling style recomputes and writes under the normalized key.
+    assert func(a=10, b=20) == 30
+    assert calls == [(10, 20)]
+    assert func.__cache_key__(10, 20) in cache
+
+
+def test_memoize_legacy_hit_does_not_change_stats(cache):
+    @cache.memoize(typed=True, ignore={'z'})
+    def func(a, *args, **kwargs):
+        return 'fresh'
+
+    from diskcache.core import args_to_key, full_name
+
+    legacy_key = args_to_key(
+        (full_name(func.__wrapped__),),
+        (1, 2),
+        {'k': 3, 'z': 9},
+        True,
+        {'z'},
+    )
+    cache.set(legacy_key, 'legacy-value')
+    cache.stats(enable=True)
+
+    assert func(1, 2, k=3, z=9) == 'legacy-value'
+    assert cache.stats() == (0, 1)
+
+
+def test_cache_key_maker_uninspectable_falls_back():
+    from diskcache.core import CacheKeyMaker, args_to_key
+
+    maker = CacheKeyMaker(iter, ('iter',))
+    args = ([1, 2, 3],)
+    assert maker(args, {}) == args_to_key(('iter',), args, {}, False, ())
+
+
+def test_cache_key_maker_legacy_key_uses_original_ignore():
+    from diskcache.core import CacheKeyMaker, args_to_key
+
+    def func(a, b, c=3):
+        pass
+
+    maker = CacheKeyMaker(func, ('func',), ignore={1, 'c'})
+    assert maker.legacy_key((1, 2, 3), {}) == args_to_key(
+        ('func',), (1, 2, 3), {}, False, {1, 'c'}
+    )
+
+
+def test_cache_key_maker_ignore_index_out_of_range():
+    from diskcache.core import CacheKeyMaker
+
+    def func(a, b=2):
+        return a + b
+
+    # An ignore index beyond the signature must not raise and leaves the
+    # normalized key unchanged.
+    maker = CacheKeyMaker(func, ('func',), ignore={5})
+    assert maker((1,), {}) == ('func', ('a', 1), ('b', 2))
+    assert maker((1,), {}) == maker((1, 2), {})

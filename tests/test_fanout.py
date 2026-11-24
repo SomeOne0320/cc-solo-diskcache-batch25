@@ -558,6 +558,46 @@ def test_memoize(cache):
     assert misses2 == misses1
 
 
+def test_memoize_argument_styles_share_key(cache):
+    calls = []
+
+    @cache.memoize(name='styles')
+    def func(a, b=2, *, c=3):
+        calls.append((a, b, c))
+        return a, b, c
+
+    assert (
+        func.__cache_key__(1)
+        == func.__cache_key__(1, 2, c=3)
+        == func.__cache_key__(a=1, b=2, c=3)
+    )
+
+    func(1)
+    func(1, 2, c=3)
+    func(a=1, b=2, c=3)
+    assert calls == [(1, 2, 3)]
+    assert len(cache) == 1
+
+
+def test_memoize_legacy_key_still_readable(cache):
+    calls = []
+
+    @cache.memoize(name='legacy')
+    def func(a, b=2):
+        calls.append((a, b))
+        return a + b
+
+    from diskcache.core import args_to_key
+
+    legacy_key = args_to_key(('legacy',), (7, 8), {}, False, ())
+    shard = cache._shards[cache._hash(legacy_key) % cache._count]
+    shard.set(legacy_key, 'legacy-value')
+
+    assert func(7, 8) == 'legacy-value'
+    assert calls == []
+    assert legacy_key in cache
+
+
 def test_copy():
     cache_dir1 = tempfile.mkdtemp()
 

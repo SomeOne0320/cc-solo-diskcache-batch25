@@ -104,3 +104,48 @@ def test_memoize_stampede(cache):
     while (time.time() - start) < 1:
         worker(100)
     assert state['num'] > 0
+
+
+def test_memoize_stampede_argument_styles_share_key(cache):
+    calls = []
+
+    @dc.memoize_stampede(cache, expire=60)
+    def func(a, b=2):
+        calls.append((a, b))
+        return a + b
+
+    assert (
+        func.__cache_key__(4)
+        == func.__cache_key__(4, 2)
+        == func.__cache_key__(a=4, b=2)
+    )
+
+    func(4)
+    func(4, 2)
+    func(a=4, b=2)
+    assert calls == [(4, 2)]
+
+
+def test_memoize_stampede_legacy_key_still_readable(cache):
+    calls = []
+
+    @dc.memoize_stampede(cache, expire=60)
+    def func(a, b=2):
+        calls.append((a, b))
+        return a + b
+
+    from diskcache.core import args_to_key, full_name
+
+    legacy_key = args_to_key(
+        (full_name(func.__wrapped__),), (40, 2), {}, False, ()
+    )
+    cache.set(legacy_key, ('legacy-value', 0.001))
+
+    # Original calling style reads the legacy entry without recomputing.
+    assert func(40, 2) == 'legacy-value'
+    assert calls == []
+    assert legacy_key in cache
+
+    # Normalized call misses the legacy entry and recomputes.
+    assert func(40) == 42
+    assert calls == [(40, 2)]

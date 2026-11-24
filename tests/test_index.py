@@ -180,5 +180,46 @@ def test_memoize(index):
     assert misses2 == misses1
 
 
+def test_memoize_argument_styles_share_key(index):
+    calls = []
+
+    @index.memoize()
+    def func(a, b=2, *, c=3):
+        calls.append((a, b, c))
+        return a, b, c
+
+    assert (
+        func.__cache_key__(1)
+        == func.__cache_key__(1, 2, c=3)
+        == func.__cache_key__(a=1, b=2, c=3)
+    )
+
+    func(1)
+    func(1, 2, c=3)
+    func(a=1, b=2, c=3)
+    assert calls == [(1, 2, 3)]
+    assert len(index) == 1
+
+
+def test_memoize_legacy_key_still_readable(index):
+    calls = []
+
+    @index.memoize()
+    def func(a, b=2):
+        calls.append((a, b))
+        return a + b
+
+    from diskcache.core import args_to_key, full_name
+
+    legacy_key = args_to_key(
+        (full_name(func.__wrapped__),), (5, 6), {}, False, ()
+    )
+    index._cache.set(legacy_key, 'legacy-value')
+
+    assert func(5, 6) == 'legacy-value'
+    assert calls == []
+    assert legacy_key in index._cache
+
+
 def test_repr(index):
     assert repr(index).startswith('Index(')

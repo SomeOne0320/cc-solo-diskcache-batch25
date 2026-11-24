@@ -286,6 +286,25 @@ class FanoutCache:
         except (Timeout, sqlite3.OperationalError):
             return default
 
+    def _memoize_legacy_get(self, key, default, retry=False):
+        """Look up a legacy memoize key without recording statistics.
+
+        Delegates to the shard owning `key`. See
+        :meth:`Cache._memoize_legacy_get` for details.
+
+        :param key: legacy key for item
+        :param default: value to return if key is not found
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: value for item or default if key not found
+
+        """
+        index = self._hash(key) % self._count
+        shard = self._shards[index]
+        try:
+            return shard._memoize_legacy_get(key, default, retry)
+        except (Timeout, sqlite3.OperationalError):
+            return default
+
     def __getitem__(self, key):
         """Return corresponding value for `key` from cache.
 

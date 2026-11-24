@@ -10,7 +10,7 @@ except ImportError:  # pragma: no cover
     # For older versions of Django simply use 300 seconds.
     DEFAULT_TIMEOUT = 300
 
-from .core import ENOVAL, args_to_key, full_name
+from .core import ENOVAL, CacheKeyMaker, full_name
 from .fanout import FanoutCache
 
 
@@ -393,6 +393,13 @@ class DjangoCache(BaseCache):
         cached separately. For example, f(3) and f(3.0) will be treated as
         distinct calls with distinct results.
 
+        Arguments are bound to the callable signature before the cache key is
+        built, so calls that pass the same bound values share an entry whether
+        the arguments are given positionally, by name, or left at their
+        defaults. Entries written by earlier diskcache versions remain
+        readable using the original calling style and are returned as-is
+        without recomputing or renewing them.
+
         The original underlying function is accessible through the __wrapped__
         attribute. This is useful for introspection, for bypassing the cache,
         or for rewrapping the function with a different cache.
@@ -420,12 +427,24 @@ class DjangoCache(BaseCache):
         def decorator(func):
             """Decorator created by memoize() for callable `func`."""
             base = (full_name(func),) if name is None else (name,)
+            key_maker = CacheKeyMaker(func, base, typed, ignore)
 
             @wraps(func)
             def wrapper(*args, **kwargs):
                 """Wrapper for callable to cache arguments and return values."""
                 key = wrapper.__cache_key__(*args, **kwargs)
                 result = self.get(key, ENOVAL, version, retry=True)
+
+                if result is ENOVAL:
+                    # Read entries written using the legacy key algorithm.
+                    legacy_key = key_maker.legacy_key(args, kwargs)
+                    if legacy_key != key:
+                        stored_legacy_key = self.make_key(
+                            legacy_key, version=version
+                        )
+                        result = self._cache._memoize_legacy_get(
+                            stored_legacy_key, ENOVAL, retry=True
+                        )
 
                 if result is ENOVAL:
                     result = func(*args, **kwargs)
@@ -448,7 +467,7 @@ class DjangoCache(BaseCache):
 
             def __cache_key__(*args, **kwargs):
                 """Make key for cache given function arguments."""
-                return args_to_key(base, args, kwargs, typed, ignore)
+                return key_maker(args, kwargs)
 
             wrapper.__cache_key__ = __cache_key__
             return wrapper

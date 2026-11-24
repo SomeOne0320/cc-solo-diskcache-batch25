@@ -5,6 +5,7 @@ import codecs
 import contextlib as cl
 import errno
 import functools as ft
+import inspect
 import io
 import json
 import os
@@ -387,6 +388,9 @@ class EmptyDirWarning(UserWarning):
 def args_to_key(base, args, kwargs, typed, ignore):
     """Create cache key out of function arguments.
 
+    Legacy key algorithm retained for reading entries written by previous
+    versions of diskcache. New entries use keys from :class:`CacheKeyMaker`.
+
     :param tuple base: base of key
     :param tuple args: function arguments
     :param dict kwargs: function keyword arguments
@@ -412,6 +416,173 @@ def args_to_key(base, args, kwargs, typed, ignore):
             key += tuple(type(value) for _, value in sorted_items)
 
     return key
+
+
+class CacheKeyMaker:
+    """Create cache keys for memoized callables.
+
+    Arguments are bound to the callable signature before the key is built so
+    that calls passing the same bound values in different styles share a key.
+    For example, ``f(1, 2)``, ``f(1, b=2)``, ``f(a=1, b=2)`` and ``f(1)``
+    where ``b`` defaults to ``2`` all produce the same key.
+
+    Positional-only, positional-or-keyword and keyword-only parameters are
+    recorded as ``(name, value)`` pairs in signature order. Excess positional
+    arguments captured by a ``*args`` parameter keep their original order and
+    excess keyword arguments captured by a ``**kwargs`` parameter are sorted
+    by name. When ``typed`` is true, the type of each included value is
+    appended in the same order.
+
+    The ``ignore`` collection may mix parameter names and positional indexes.
+    Ignoring an index removes the parameter bound at that position whether it
+    is passed positionally or by name; named entries apply to regular
+    parameters as well as those captured by ``**kwargs``.
+
+    Callables whose signature cannot be inspected, or calls that cannot be
+    bound, fall back to the legacy :func:`args_to_key` algorithm so that the
+    original calling style continues to read entries written before this
+    algorithm was introduced.
+
+    """
+
+    def __init__(self, func, base, typed=False, ignore=()):
+        """Initialize cache key maker.
+
+        :param func: callable to bind arguments against
+        :param tuple base: base of key, typically the callable name
+        :param bool typed: include value types in cache key (default False)
+        :param set ignore: positional indexes or parameter names to ignore
+
+        """
+        self._base = base
+        self._typed = typed
+        self._ignore_names = set()
+        self._ignore_indexes = set()
+        self._vararg_start = None
+        self._legacy_ignore = set(ignore)
+
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            signature = None
+
+        self._signature = signature
+
+        if signature is None:
+            return
+
+        parameters = signature.parameters
+
+        vararg = next(
+            (
+                param
+                for param in parameters.values()
+                if param.kind is inspect.Parameter.VAR_POSITIONAL
+            ),
+            None,
+        )
+
+        if vararg is not None:
+            self._vararg_start = list(parameters).index(vararg.name)
+
+        for item in ignore:
+            if isinstance(item, int) and not isinstance(item, bool):
+                self._ignore_indexes.add(item)
+                if self._vararg_start is None or item < self._vararg_start:
+                    try:
+                        name = list(parameters)[item]
+                    except IndexError:
+                        pass
+                    else:
+                        param = parameters[name]
+                        if param.kind in (
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        ):
+                            self._ignore_names.add(name)
+            else:
+                self._ignore_names.add(item)
+
+    def __call__(self, args, kwargs):
+        """Make cache key for ``args`` and ``kwargs``.
+
+        :param tuple args: positional function arguments
+        :param dict kwargs: keyword function arguments
+        :return: cache key tuple
+
+        """
+        if self._signature is None:
+            return args_to_key(
+                self._base, args, kwargs, self._typed, self._legacy_ignore
+            )
+
+        try:
+            bound = self._signature.bind(*args, **kwargs)
+        except TypeError:
+            return args_to_key(
+                self._base, args, kwargs, self._typed, self._legacy_ignore
+            )
+
+        bound.apply_defaults()
+
+        key = self._base
+        value_types = []
+
+        for name, value in bound.arguments.items():
+            param = self._signature.parameters[name]
+
+            if param.kind is inspect.Parameter.VAR_POSITIONAL:
+                values = tuple(
+                    item
+                    for index, item in enumerate(value)
+                    if (self._vararg_start + index)
+                    not in self._ignore_indexes
+                )
+                key += (values,)
+                if self._typed:
+                    value_types.extend(type(item) for item in values)
+                continue
+
+            if name in self._ignore_names:
+                continue
+
+            if param.kind is inspect.Parameter.VAR_KEYWORD:
+                items = tuple(
+                    (key_name, key_value)
+                    for key_name, key_value in sorted(value.items())
+                    if key_name not in self._ignore_names
+                )
+                key += (items,)
+                if self._typed:
+                    value_types.extend(
+                        type(key_value) for _, key_value in items
+                    )
+                continue
+
+            key += ((name, value),)
+            if self._typed:
+                value_types.append(type(value))
+
+        if self._typed:
+            key += (tuple(value_types),)
+
+        return key
+
+    def legacy_key(self, args, kwargs):
+        """Return the cache key produced by the legacy algorithm.
+
+        The original ``ignore`` collection is passed through unchanged so the
+        key exactly matches what earlier diskcache versions wrote for the same
+        calling style.
+
+        :param tuple args: positional function arguments
+        :param dict kwargs: keyword function arguments
+        :return: legacy cache key tuple
+
+        """
+        return args_to_key(
+            self._base, args, kwargs, self._typed, self._legacy_ignore
+        )
 
 
 class Cache:
@@ -1221,6 +1392,44 @@ class Cache:
         else:
             return value
 
+    def _memoize_legacy_get(self, key, default, retry=False):
+        """Look up a legacy memoize key without recording cache statistics.
+
+        Used by memoize decorators to read entries written by previous
+        versions of diskcache. A legacy hit is returned as-is: the entry is
+        neither recomputed nor re-stored, so its expiry is left untouched.
+        The lookup is read-only like :meth:`__contains__`, neither updating
+        statistics nor eviction columns, as it is part of a single memoized
+        call already counted against the current key.
+
+        :param key: legacy key for item
+        :param default: value to return if key is not found
+        :param bool retry: retry if database timeout occurs (default False)
+        :return: value for item or default if key not found
+
+        """
+        db_key, raw = self._disk.put(key)
+        select = (
+            'SELECT rowid, expire_time, tag, mode, filename, value'
+            ' FROM Cache WHERE key = ? AND raw = ?'
+            ' AND (expire_time IS NULL OR expire_time > ?)'
+        )
+        sql = self._sql_retry if retry else self._sql
+        rows = sql(select, (db_key, raw, time.time())).fetchall()
+
+        if not rows:
+            return default
+
+        (
+            (_rowid, _expire_time, _tag, mode, filename, db_value),
+        ) = rows
+
+        try:
+            return self._disk.fetch(mode, filename, db_value, False)
+        except IOError:
+            # Key was deleted before we could retrieve result.
+            return default
+
     def __getitem__(self, key):
         """Return corresponding value for `key` from cache.
 
@@ -1812,6 +2021,15 @@ class Cache:
         cached separately. For example, f(3) and f(3.0) will be treated as
         distinct calls with distinct results.
 
+        Arguments are bound to the callable signature before the cache key is
+        built, so calls that pass the same bound values share an entry whether
+        the arguments are given positionally, by name, or left at their
+        defaults. Positional arguments captured by ``*args`` keep their order
+        and extra keyword arguments are handled by name. Entries written by
+        earlier diskcache versions remain readable using the original calling
+        style; such legacy entries are returned as-is without recomputing or
+        renewing them.
+
         The original underlying function is accessible through the __wrapped__
         attribute. This is useful for introspection, for bypassing the cache,
         or for rewrapping the function with a different cache.
@@ -1864,12 +2082,21 @@ class Cache:
         def decorator(func):
             """Decorator created by memoize() for callable `func`."""
             base = (full_name(func),) if name is None else (name,)
+            key_maker = CacheKeyMaker(func, base, typed, ignore)
 
             @ft.wraps(func)
             def wrapper(*args, **kwargs):
                 """Wrapper for callable to cache arguments and return values."""
                 key = wrapper.__cache_key__(*args, **kwargs)
                 result = self.get(key, default=ENOVAL, retry=True)
+
+                if result is ENOVAL:
+                    # Read entries written by versions using the legacy key.
+                    legacy_key = key_maker.legacy_key(args, kwargs)
+                    if legacy_key != key:
+                        result = self._memoize_legacy_get(
+                            legacy_key, ENOVAL, retry=True
+                        )
 
                 if result is ENOVAL:
                     result = func(*args, **kwargs)
@@ -1880,7 +2107,7 @@ class Cache:
 
             def __cache_key__(*args, **kwargs):
                 """Make key for cache given function arguments."""
-                return args_to_key(base, args, kwargs, typed, ignore)
+                return key_maker(args, kwargs)
 
             wrapper.__cache_key__ = __cache_key__
             return wrapper

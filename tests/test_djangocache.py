@@ -1136,3 +1136,45 @@ class DiskCacheTests(BaseCacheTests, TestCase):
 
         self.assertEqual(hits2, hits1 + count)
         self.assertEqual(misses2, misses1)
+
+    def test_memoize_argument_styles_share_key(self):
+        calls = []
+
+        @cache.memoize()
+        def func(a, b=2, *, c=3):
+            calls.append((a, b, c))
+            return a, b, c
+
+        self.assertEqual(
+            func.__cache_key__(1),
+            func.__cache_key__(1, 2, c=3),
+        )
+        self.assertEqual(
+            func.__cache_key__(1),
+            func.__cache_key__(a=1, b=2, c=3),
+        )
+
+        func(1)
+        func(1, 2, c=3)
+        func(a=1, b=2, c=3)
+        self.assertEqual(calls, [(1, 2, 3)])
+
+    def test_memoize_legacy_key_still_readable(self):
+        from diskcache.core import args_to_key, full_name
+
+        calls = []
+
+        @cache.memoize()
+        def func(a, b=2):
+            calls.append((a, b))
+            return a + b
+
+        legacy_key = args_to_key(
+            (full_name(func.__wrapped__),), (7, 8), {}, False, ()
+        )
+        cache.set(legacy_key, 'legacy-value')
+
+        self.assertEqual(func(7, 8), 'legacy-value')
+        self.assertEqual(calls, [])
+        stored_legacy_key = cache.make_key(legacy_key)
+        self.assertIn(stored_legacy_key, cache._cache)
